@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="header.png" alt="Abraxas Labs — gitea-hostmatcher-0000-ssrf" width="100%">
+  <img src="header.png" alt="Abraxas Labs - gitea-hostmatcher-0000-ssrf" width="100%">
 </p>
 
 <p align="center">
@@ -14,148 +14,66 @@
 
 # gitea-hostmatcher-0000-ssrf
 
-**Gitea** `1.27.3` — Gitea
+**Gitea** `1.27.3` - Gitea
 
-Unpublished Gitea source finding: hostmatcher residual SSRF via 0.0.0.0/8.
+[CVE-2026-22874](https://github.com/go-gitea/gitea/security/advisories/GHSA-2r5c-gw76-rh3w) added [`reservedIPNets`](https://github.com/go-gitea/gitea/blob/v1.27.3/modules/hostmatcher/hostmatcher.go). CGNAT, TEST-NET, NAT64, Teredo, Azure WireServer. Real ranges. Not [RFC 6890](https://datatracker.ietf.org/doc/html/rfc6890) `0.0.0.0/8`, the old "this network" block. IANA still publishes it. Go `IsGlobalUnicast` is **true** for `0.0.0.1`. It is not `IsLoopback` (`127.0.0.0/8`). It is not `IsPrivate`. The default external allow-list treats it as the public internet. Linux will deliver `0.0.0.1` to a local socket if that address is on `lo`. Same listener, two names.
+
+**A signed-in user can webhook `http://0.0.0.1` and read the HTTP body from hook history. `127.0.0.1` on the same port is denied.**
 
 | | |
 |---|---|
-| ID | Unpublished Gitea source finding #3 (no CVE yet) |
+| ID | no CVE yet |
 | CWE | [CWE-918](https://cwe.mitre.org/data/definitions/918.html) |
 | CVSS | **High: 7.7** `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N` |
 | Product | [Gitea](https://github.com/go-gitea/gitea) |
-| Affected | all versions **through 1.27.3** (inclusive) |
-| Patched | vendor patch — see references |
-| Auth | authenticated (see source map) |
+| Affected | through **v1.27.3** (`146cc3e`); leftover of CVE-2026-22874 |
+| Auth | signed-in user who can create a repo webhook |
 | License | [GNU Affero GPL v3.0](LICENSE) |
-| Lab | `127.0.0.1` only · vendor/client disclosure pack, not a scanner |
+| Lab | `127.0.0.1` only |
 
----
+## What an attacker can do
 
-## Advisory (from the source map)
+Register (default open registration), create a repo, point a webhook at `http://0.0.0.1:<local-port>/`, test it, and read the response body from hook history. That is loopback HTTP that `127.0.0.1` on the same port cannot reach: anything listening in Gitea's netns that bound more broadly than loopback, including services the operator thought were "localhost only" because they blocked `127.0.0.0/8`.
 
-modules/hostmatcher/hostmatcher.go reservedIPNets leftover of CVE-2026-22874. RFC 6890 0.0.0.0/8 not listed. Go IsGlobalUnicast is true for 0.0.0.1.
+It does not set `X-Gitea-Internal-Auth`. It is not RCE by itself. It is a full HTTP body from an address the allow-list still calls external.
 
----
+## How I found it
 
-## Entry
+v1.27.3 is the build that closed the 2026 GHSA wave. I sat on that tag anyway. Patches that add an allow-list or a deny-list are a gift: you read the list, then you ask what IANA still has that the list forgot. Two leftovers already had labs on this tree ([keys IDOR](https://github.com/abraxas/gitea-user-keys-idor) and [git-redirect SSRF](https://github.com/abraxas/gitea-git-redir-ssrf)). The leftover table on that post listed a webhook to `http://0.0.0.1/` as a map. This is the SUCCESS.
 
-- **Method:** `POST`
-- **Path:** `/api/v1/repos/{owner}/{repo}/hooks`
-- **Router:** Authenticated webhook create + test. hostmatcher reservedIPNets misses 0.0.0.0/8. Delivery stores the HTTP body in hook history.
-- **Notes:** Authenticated unpublished Gitea #3 CWE-918 v1.27.3. Witness: GITEA-0000-SSRF in hook history. Not eval. Not a reverse shell. 127.0.0.1 on the same port must stay blocked.
+Webhook delivery stores the HTTP body in hook history. That is a better oracle than git clone, which is mostly "did the fetch work." I put an oracle in Gitea's netns on port 8080, added `0.0.0.1/8` on `lo` with `NET_ADMIN`, and created two webhooks. Negative control first.
 
-### Call chain
+Wrong turns already recorded: treating webhook create HTTP 201 as the oracle (history is the oracle); `127.0.0.1` delivery succeeding (that would be a different bug - lab requires it denied); hitting `/api/internal` with `X-Gitea-Internal-Auth`; a reverse shell. Theatre. The witness is `GITEA-0000-SSRF` in hook history.
 
-- `POST /api/v1/repos/{owner}/{repo}/hooks url=http://127.0.0.1:8080/ssrf`
-- `POST .../hooks/{id}/tests then GET hook history — deny`
-- `POST /api/v1/repos/{owner}/{repo}/hooks url=http://0.0.0.1:8080/ssrf`
-- `hostmatcher reservedIPNets miss 0.0.0.0/8 — delivery stores body`
-
-### Lab preconditions
-
-- Gitea 1.27.3
-- Account that can create a repo webhook
-- Oracle sharing Gitea netns on port 8080
-
-### Witness
-
-hook history for 0.0.0.1 contains GITEA-0000-SSRF; 127.0.0.1 webhook denied
-
-### Not success
-
-- eval/base64/system payload
-- reverse shell
-- X-Gitea-Internal-Auth
-- 127.0.0.1 delivery succeeding
-
----
-
-## Patch / remediation
-
-**Do this first:** Apply the vendor patch for **Gitea**. See references.
-
-**Verify after upgrade**
-
-- Re-run `gitea-hostmatcher-0000-ssrf-Abraxas-Labs.py` against the patched build: the mapped witness must **not** appear.
-- Confirm the vendor advisory / changeset in the deployed tree (see references).
-- A WAF signature is delay, not a patch.
-
-**If you cannot update immediately**
-
-- Disable or isolate the affected component.
-- Hunt for the witness condition on production (new privileged users, unexpected files, injected rows — whatever this CVE's map names).
-
----
-
-## Reproduction (authorized lab)
-
-Target **only** `http://127.0.0.1:8088` (or the loopback you bound). Do not point this script at the internet.
-
-```bash
-python3 gitea-hostmatcher-0000-ssrf-Abraxas-Labs.py
-```
-
-Success is the **witness** above in the response body. Generic 200 HTML is not it.
-
----
-
-## Lab images
-
-Loopback stack used to reproduce. Official images unless a `Dockerfile` in this folder builds from source.
-
-- [`lab/docker-compose.yml`](lab/docker-compose.yml)
-- [`lab/Dockerfile`](lab/Dockerfile)
-- [`lab/run.sh`](lab/run.sh)
+## Lab
 
 ```bash
 cd lab
-docker compose up --force-recreate
+./run.sh
 ```
 
-Bind the vulnerable product tree next to Compose if the YAML mounts a local directory (plugin zip / source tag from the version table). Publish nothing except `127.0.0.1`.
+Target **only** `http://127.0.0.1:18131`. Oracle shares Gitea's netns on port 8080. `run.sh` adds `0.0.0.1/8` on `lo`.
 
----
+```text
+create-hook name=neg-loopback status=201
+negative-control 127.0.0.1 blocked
+create-hook name=hit-0000 status=201
+poll id=2 witness=True
+SUCCESS GITEA-HOSTMATCHER-0000
+```
+
+## The fix
+
+Add `0.0.0.0/8` to `reservedIPNets`, or stop treating `IsGlobalUnicast` as "safe to dial." `0.0.0.1` must be denied the same way `127.0.0.1` is.
 
 ## References
 
-- [github.com/go-gitea/gitea](https://github.com/go-gitea/gitea) tag v1.27.3
-
-- Abraxas Labs: [abraxaslabs.tech](https://abraxaslabs.tech) · [github.com/abraxas](https://github.com/abraxas) · [@abraxas_null](https://x.com/abraxas_null)
-
----
-
-## Records (structured)
-
-```
-# Gitea unpublished #3 — hostmatcher 0.0.0.0/8 SSRF
-
-CWE: CWE-918
-Severity: High (source review)
-
-## Description
-
-`reservedIPNets` after CVE-2026-22874 still omits RFC 6890 `0.0.0.0/8`. A signed-in user can set a webhook to `http://0.0.0.1` and read the full HTTP body from hook history. `127.0.0.1` on the same port is denied.
-
-## Product
-
-Gitea 1.27.3. Lab oracle is GITEA-0000-SSRF in hook history, not a shell.
-```
-
----
+- [github.com/go-gitea/gitea](https://github.com/go-gitea/gitea) tag [v1.27.3](https://github.com/go-gitea/gitea/releases/tag/v1.27.3)
+- [`hostmatcher.go`](https://github.com/go-gitea/gitea/blob/v1.27.3/modules/hostmatcher/hostmatcher.go)
+- Nearby patched: [CVE-2026-22874](https://github.com/go-gitea/gitea/security/advisories/GHSA-2r5c-gw76-rh3w)
+- [RFC 6890](https://datatracker.ietf.org/doc/html/rfc6890)
+- [CWE-918](https://cwe.mitre.org/data/definitions/918.html)
 
 ## License
 
-This disclosure pack is licensed under the **GNU Affero General Public License v3.0**. See [LICENSE](LICENSE).
-
----
-
-## Disclaimer
-
-This pack is for **the vendor, the site owner, and licensed labs**. The script talks to `127.0.0.1`. Using it against systems you do not own is not authorized by Abraxas Labs. No warranty.
-
-<p align="center">
-  <a href="https://abraxaslabs.tech">abraxaslabs.tech</a> ·
-  <a href="https://github.com/abraxas">github.com/abraxas</a> ·
-  <a href="https://x.com/abraxas_null">@abraxas_null</a>
-</p>
+GNU Affero GPL v3.0. See [LICENSE](LICENSE). Loopback lab only. No warranty.
