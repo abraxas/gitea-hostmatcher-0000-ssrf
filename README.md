@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/gitea-hostmatcher-0000-ssrf">gitea-hostmatcher-0000-ssrf</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/gitea-hostmatcher-0000-ssrf"><strong>https://abraxaslabs.tech/research/gitea-hostmatcher-0000-ssrf</strong></a>
+</p>
+
 
 # gitea-hostmatcher-0000-ssrf
 
